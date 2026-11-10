@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pathlib import Path
 from datetime import datetime
@@ -12,8 +13,10 @@ from slowapi.errors import RateLimitExceeded
 
 from app.monitoring import MonitoringService, RequestMetrics
 
-from app.agent import primary_llm, cache_manager, fallback_llm, build_graph
+from app.agent import (primary_llm, cache_manager, fallback_llm, build_graph,
+                       provider_breakers)
 from app.config import get_settings
+from app.resilience import ConcurrencyLimiter
 from app.models import (ChatRequest, ChatResponse,
                         HealthResponse, MetricsResponse,
                         ErrorResponse)
@@ -34,6 +37,9 @@ if _frontend.exists():
 settings = get_settings()
 graph = build_graph()
 monitoring_service = MonitoringService()
+# Admission control: past this many in-flight /chat requests, shed load with
+# 503 + Retry-After instead of queueing more work onto the providers.
+admission = ConcurrencyLimiter(settings.max_concurrent_requests)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -68,6 +74,9 @@ async def health():
         if "unhealthy" in v:
             check_status=False
 
+    for provider, breaker in provider_breakers.items():
+        check[f"circuit_{provider}"] = breaker.state
+
     return HealthResponse(
         status=("healthy" if check_status else "unhealthy"),
         environment=settings.app_env,
@@ -80,6 +89,19 @@ async def health():
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit(settings.rate_limit)
 async def chat(request:Request,message: ChatRequest):
+    if not admission.try_acquire():
+        raise HTTPException(
+            status_code=503,
+            detail="Server is at capacity, please retry shortly.",
+            headers={"Retry-After": "1"},
+        )
+    try:
+        return await _handle_chat(message)
+    finally:
+        admission.release()
+
+
+async def _handle_chat(message: ChatRequest):
     start_time = time.time()
     initial_state = {
         "question": message.message,
@@ -91,11 +113,15 @@ async def chat(request:Request,message: ChatRequest):
         "intent": None,
         "answer": None,
         "model_used": None,
+        "fallback_used": None,
         "input_tokens": None,
         "output_tokens": None,
     }
-    result=graph.invoke(initial_state,
-                        config={"configurable": {"thread_id": message.thread_id}})
+    # The graph makes blocking LLM calls; run it off the event loop so one
+    # slow provider call doesn't stall every other request.
+    result = await run_in_threadpool(
+        graph.invoke, initial_state,
+        config={"configurable": {"thread_id": message.thread_id}})
     latency_ms=round((time.time() - start_time) * 1000)
 
     monitoring_service.record_request(RequestMetrics(
@@ -108,7 +134,8 @@ async def chat(request:Request,message: ChatRequest):
         input_tokens=result.get("input_tokens") or 0,
         output_tokens=result.get("output_tokens") or 0,
         blocked=result["blocked"],
-        error=result["block_reason"] if result["blocked"] else None
+        error=result["block_reason"] if result["blocked"] else None,
+        fallback_used=bool(result.get("fallback_used")),
     ))
 
     if result["blocked"]==True:
@@ -129,7 +156,10 @@ async def chat(request:Request,message: ChatRequest):
 
 @app.get("/metrics", response_model=MetricsResponse)
 async def metrics():
-    return monitoring_service.get_summary()
+    summary = monitoring_service.get_summary()
+    summary["rejected_requests"] = admission.rejected
+    summary["in_flight_requests"] = admission.in_flight
+    return summary
 
 
 

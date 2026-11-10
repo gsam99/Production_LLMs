@@ -19,6 +19,7 @@ class RequestMetrics:
     output_tokens: int = 0
     blocked: bool = False
     error: Optional[str] = None
+    fallback_used: bool = False
 
 class MonitoringService:
 
@@ -89,7 +90,8 @@ class MonitoringService:
                 "avg_latency_ms": 0.0,
                 "cache_hit_rate": "0.0%",
                 "total_input_tokens": 0,
-                "total_output_tokens": 0
+                "total_output_tokens": 0,
+                "fallback_count": 0
             }
         avg_latency = self.total_latency_ms / self.total_requests
         error_rate=(self.total_errors / self.total_requests) * 100
@@ -107,7 +109,8 @@ class MonitoringService:
             "avg_latency_ms": round(avg_latency, 2),
             "cache_hit_rate": f"{cache_hit_rate:.1f}%",
             "total_input_tokens": self.total_input_tokens,
-            "total_output_tokens": self.total_output_tokens
+            "total_output_tokens": self.total_output_tokens,
+            "fallback_count": sum(1 for r in self.request_history if r.fallback_used)
         }
 
     def reset(self) -> None:

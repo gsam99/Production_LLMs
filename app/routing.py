@@ -56,8 +56,7 @@ class ModelRouter:
             result = self.llm_classify(text)
         if result == "simple":
             return self.settings.primary_model
-        else:
-            return self.settings.fallback_model
+        return self.settings.complex_model
 
 
 

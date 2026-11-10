@@ -38,6 +38,9 @@ class MetricsResponse(BaseModel):
     cache_hit_rate:str
     total_input_tokens: int
     total_output_tokens:int
+    fallback_count:int=0
+    rejected_requests:int=0
+    in_flight_requests:int=0
 
 class ErrorResponse(BaseModel):
     error: str

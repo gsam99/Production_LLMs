@@ -14,8 +14,10 @@ class Settings(BaseSettings):
     upstash_redis_rest_url: str= ""
     upstash_redis_rest_token: str = ""
     openai_api_key:str =""
-    primary_model:str ="gpt-4o-mini"
-    fallback_model:str="gpt-4o-mini"
+    # Model tiers. Swapping a model or provider is a config/env change.
+    primary_model:str ="gpt-4o-mini"      # simple requests (and the classifier)
+    complex_model:str="gpt-4o"            # requests the router marks complex
+    failover_model:str="claude-sonnet-4-5"  # used when the routed model fails
 
     anthropic_api_key:str =""
     anthropic_primary_model:str = "claude-haiku-4-5"
@@ -30,6 +32,11 @@ class Settings(BaseSettings):
     rate_limit: str="20/minute"
     cache_ttl_seconds: int=300
     max_retries: int=3
+
+    # Resilience: per-provider circuit breaker and in-flight request cap.
+    breaker_failure_threshold: int=5
+    breaker_reset_seconds: float=30.0
+    max_concurrent_requests: int=50
 
     model_config={"env_file":".env","extra":"ignore"}
 

@@ -4,8 +4,9 @@ from app.config import get_settings
 from app.security import SecurityPipeline
 from app.cache import CacheManager
 from app.routing import ModelRouter
-from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
+from app.providers import (ModelRegistry, provider_for, failover_chain,
+                           invoke_with_failover)
+from app.resilience import CircuitBreaker
 from langgraph.graph import StateGraph, END
 
 settings = get_settings()
@@ -22,6 +23,7 @@ class AgentState(TypedDict):
     intent: Optional[str]
     answer: Optional[str]
     model_used: Optional[str]
+    fallback_used: Optional[bool]
     input_tokens: Optional[int]
     output_tokens: Optional[int]
 
@@ -31,9 +33,22 @@ security_pipeline = SecurityPipeline()
 cache_manager = CacheManager()
 model_router = ModelRouter()
 
-primary_llm = ChatOpenAI(model=settings.primary_model, api_key=settings.openai_api_key)
-fallback_llm = ChatAnthropic(model="claude-sonnet-4-5", api_key=settings.anthropic_api_key)
-intent_llm = ChatOpenAI(model=settings.primary_model, api_key=settings.openai_api_key)
+model_registry = ModelRegistry(settings)
+primary_llm = model_registry.get(settings.primary_model)
+fallback_llm = model_registry.get(settings.failover_model)
+intent_llm = primary_llm
+
+# One breaker per provider, so an OpenAI outage stops sending traffic to
+# OpenAI for a cool-down period instead of failing every request first.
+provider_breakers = {
+    provider: CircuitBreaker(
+        provider,
+        failure_threshold=settings.breaker_failure_threshold,
+        reset_seconds=settings.breaker_reset_seconds,
+    )
+    for provider in {provider_for(m) for m in (
+        settings.primary_model, settings.complex_model, settings.failover_model)}
+}
 
 INTENT_CATEGORIES = [
     "general_question",
@@ -44,17 +59,7 @@ INTENT_CATEGORIES = [
 ]
 
 
-# 3. Helper function
-def is_bad_response(text: str) -> bool:
-    if not text or not text.strip():
-        return True
-    refusal_phrases = ["i can't help with that", "i'm unable to", "as an ai, i cannot"]
-    if any(phrase in text.lower() for phrase in refusal_phrases):
-        return True
-    return False
-
-
-# 4. Node functions
+# 3. Node functions
 def security_check_node(state: AgentState) -> dict:
     is_safe, text, reason = security_pipeline.process_input(state["question"])
     if not is_safe:
@@ -89,38 +94,15 @@ def route_model_node(state: AgentState) -> dict:
 
 
 def call_llm_node(state: AgentState) -> dict:
-    try:
-        response = primary_llm.invoke(state["cleaned_question"])
-        answer = response.content
-
-        if is_bad_response(answer):
-            raise ValueError("Primary model returned an unusable response")
-
-        usage = response.usage_metadata or {}
-        return {
-            "answer": answer,
-            "model_used": settings.primary_model,
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-        }
-
-    except Exception:
-        try:
-            response = fallback_llm.invoke(state["cleaned_question"])
-            usage = response.usage_metadata or {}
-            return {
-                "answer": response.content,
-                "model_used": "claude-sonnet-4-5",
-                "input_tokens": usage.get("input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-            }
-        except Exception:
-            return {
-                "answer": "The request could not be processed by either the primary or fallback model.",
-                "model_used": "none",
-                "input_tokens": 0,
-                "output_tokens": 0,
-            }
+    # Call the model the router picked; fail over to the failover model when
+    # it errors, its provider's circuit is open, or the answer is unusable.
+    chosen = state.get("model_used") or settings.primary_model
+    return invoke_with_failover(
+        state["cleaned_question"],
+        failover_chain(chosen, settings.failover_model),
+        model_registry,
+        provider_breakers,
+    )
 
 
 def validate_output_node(state: AgentState) -> dict:
@@ -129,7 +111,9 @@ def validate_output_node(state: AgentState) -> dict:
 
 
 def save_to_cache_node(state: AgentState) -> dict:
-    cache_manager.set(state["cleaned_question"], state["answer"])
+    # Don't cache the "no model available" message during an outage.
+    if state.get("model_used") != "none":
+        cache_manager.set(state["cleaned_question"], state["answer"])
     return {}
 
 
